@@ -1,0 +1,500 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sun Metro Bus Stop Mobility — Where Riders Go</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<link rel="stylesheet" href="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
+<script src="https://unpkg.com/h3-js@4.1.0/dist/h3-js.umd.js"></script>
+<style>
+  :root{
+    --paper:#f7f4ec; --ink:#141414; --panel:#ffffff; --line:#e4e0d4;
+    --hl:#f4e600; --hl-dark:#c9bd00; --pink:#ff3d7f; --teal:#00b39f; --blue:#3d6bff;
+    --gray:#8b8578;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;padding:0;background:var(--paper);color:var(--ink);
+    font-family:-apple-system,"Helvetica Neue",Helvetica,Arial,sans-serif;}
+  a{color:inherit;}
+
+  #topbar{display:flex;align-items:baseline;justify-content:space-between;
+    padding:18px 28px 8px;border-bottom:4px solid var(--ink);}
+  #topbar h1{font-size:22px;font-weight:800;margin:0;letter-spacing:-0.01em;}
+  #topbar .sub{font-size:12px;color:var(--gray);margin-top:2px;}
+  #pull-select{font-size:13px;padding:6px 10px;border:2px solid var(--ink);border-radius:6px;
+    background:var(--panel);font-weight:600;}
+
+  #headline{display:flex;gap:0;flex-wrap:wrap;border-bottom:2px solid var(--line);}
+  .stat{flex:1;min-width:130px;padding:14px 20px;border-right:2px solid var(--line);}
+  .stat:last-child{border-right:none;}
+  .stat .num{font-size:32px;font-weight:800;line-height:1;}
+  .stat .lbl{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--gray);margin-top:4px;font-weight:700;}
+  .stat.hl .num{color:var(--pink);}
+
+  #layout{display:grid;grid-template-columns:250px 1fr 300px;gap:0;
+    height:calc(100vh - 140px);min-height:560px;}
+  #sidebar-left, #sidebar-right{overflow-y:auto;padding:16px;background:var(--panel);}
+  #sidebar-left{border-right:2px solid var(--line);}
+  #sidebar-right{border-left:2px solid var(--line);}
+  #map-wrap{position:relative;}
+  #map{position:absolute;inset:0;}
+
+  .section{margin-bottom:22px;}
+  .section h3{font-size:11px;text-transform:uppercase;letter-spacing:.07em;
+    font-weight:800;margin:0 0 8px;color:var(--ink);border-bottom:2px solid var(--ink);padding-bottom:4px;}
+  select, .btn-select{width:100%;padding:7px 8px;font-size:13px;border:2px solid var(--ink);
+    border-radius:6px;background:var(--panel);font-weight:600;}
+
+  .pill-row{display:flex;flex-wrap:wrap;gap:6px;}
+  .pill{padding:5px 10px;font-size:11px;font-weight:700;border:2px solid var(--ink);
+    border-radius:100px;background:var(--panel);cursor:pointer;user-select:none;white-space:nowrap;}
+  .pill.active{background:var(--hl);border-color:var(--ink);}
+  .pill.mode-active-walk{background:var(--teal);color:#fff;}
+  .pill.mode-active-car{background:var(--blue);color:#fff;}
+  .pill.mode-active-bike{background:var(--pink);color:#fff;}
+  .pill.mode-active-all{background:var(--hl);}
+
+  #clear-filters{width:100%;padding:8px;font-size:12px;font-weight:800;border:2px solid var(--ink);
+    border-radius:6px;background:var(--ink);color:var(--paper);cursor:pointer;margin-top:4px;}
+
+  .layer-toggle{display:flex;align-items:center;gap:8px;font-size:12px;font-weight:600;margin-bottom:6px;cursor:pointer;}
+  .layer-toggle .swatch{width:12px;height:12px;border-radius:3px;flex-shrink:0;}
+
+  #lasso-btn{width:100%;padding:8px;font-size:12px;font-weight:800;border:2px dashed var(--ink);
+    border-radius:6px;background:var(--panel);cursor:pointer;margin-top:6px;}
+  #lasso-btn.active{background:var(--hl);}
+
+  .chart-block{margin-bottom:20px;}
+  .chart-block h3{font-size:11px;text-transform:uppercase;letter-spacing:.06em;font-weight:800;
+    margin:0 0 8px;border-bottom:2px solid var(--ink);padding-bottom:4px;}
+  .bar-row{display:flex;align-items:center;gap:6px;margin-bottom:5px;font-size:11px;}
+  .bar-label{width:92px;flex-shrink:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600;}
+  .bar-track{flex:1;height:14px;background:var(--line);border-radius:3px;overflow:hidden;}
+  .bar-fill{height:100%;background:var(--pink);}
+  .bar-val{width:34px;text-align:right;flex-shrink:0;font-weight:700;font-variant-numeric:tabular-nums;}
+
+  .leaflet-popup-content{font-size:12px;font-family:inherit;}
+  #legend{position:absolute;bottom:14px;left:14px;background:rgba(255,255,255,.94);
+    border:2px solid var(--ink);border-radius:8px;padding:8px 12px;font-size:11px;font-weight:600;z-index:1000;}
+</style>
+</head>
+<body>
+
+<div id="topbar">
+  <div>
+    <h1>Where Bus Riders Go</h1>
+    <div class="sub">Sun Metro bus-stop mobility — walking paths, destinations, and home/work areas by route</div>
+  </div>
+  <select id="pull-select"></select>
+</div>
+
+<div id="headline">
+  <div class="stat hl"><div class="num" id="stat-n">–</div><div class="lbl">Trips shown</div></div>
+  <div class="stat"><div class="num" id="stat-walk">–</div><div class="lbl">% Walking</div></div>
+  <div class="stat"><div class="num" id="stat-home">–</div><div class="lbl">Home trips</div></div>
+  <div class="stat"><div class="num" id="stat-work">–</div><div class="lbl">Work trips</div></div>
+  <div class="stat"><div class="num" id="stat-errand">–</div><div class="lbl">Errand trips</div></div>
+  <div class="stat"><div class="num" id="stat-stops">–</div><div class="lbl">Stops active</div></div>
+</div>
+
+<div id="layout">
+  <div id="sidebar-left">
+    <div class="section">
+      <h3>Route</h3>
+      <select id="route-select"><option value="">All routes</option></select>
+    </div>
+    <div class="section">
+      <h3>Stop</h3>
+      <select id="stop-select"><option value="">All stops</option></select>
+    </div>
+    <div class="section">
+      <h3>Travel mode</h3>
+      <div class="pill-row" id="mode-pills">
+        <div class="pill active mode-active-all" data-mode="all">All</div>
+        <div class="pill" data-mode="0">Walk</div>
+        <div class="pill" data-mode="1">Car</div>
+        <div class="pill" data-mode="2">Bike</div>
+      </div>
+    </div>
+    <div class="section">
+      <h3>Errand category</h3>
+      <div class="pill-row" id="category-pills"></div>
+    </div>
+    <div class="section">
+      <h3>Zip code</h3>
+      <select id="zip-select"><option value="">All zips</option></select>
+    </div>
+    <div class="section">
+      <h3>Draw an area</h3>
+      <button id="lasso-btn">✏️ Draw custom area</button>
+    </div>
+    <button id="clear-filters">Clear all filters</button>
+  </div>
+
+  <div id="map-wrap"><div id="map"></div>
+    <div id="legend">
+      <div class="layer-toggle"><input type="checkbox" id="toggle-paths" checked><span class="swatch" style="background:#ff3d7f"></span>Walked paths (fine)</div>
+      <div class="layer-toggle"><input type="checkbox" id="toggle-home" checked><span class="swatch" style="background:#00b39f"></span>Home areas</div>
+      <div class="layer-toggle"><input type="checkbox" id="toggle-work"><span class="swatch" style="background:#3d6bff"></span>Work areas</div>
+      <div class="layer-toggle"><input type="checkbox" id="toggle-dest" checked><span class="swatch" style="background:#f4e600;border:1px solid #141414"></span>Destinations</div>
+    </div>
+  </div>
+
+  <div id="sidebar-right">
+    <div class="chart-block"><h3>Top destinations</h3><div id="chart-destinations"></div></div>
+    <div class="chart-block"><h3>Top streets walked</h3><div id="chart-streets"></div></div>
+    <div class="chart-block"><h3>Mode split</h3><div id="chart-modes"></div></div>
+  </div>
+</div>
+
+<script>
+// ---------- Core filtering/aggregation (verified standalone before embedding) ----------
+function filterTrips(trips, filters, stopById) {
+  return trips.filter(t => {
+    if (filters.route && !(stopById[t.s] && stopById[t.s].routes.includes(filters.route))) return false;
+    if (filters.stop && t.s !== filters.stop) return false;
+    if (filters.mode !== 'all' && t.m !== filters.mode) return false;
+    if (filters.categories && filters.categories.size > 0) {
+      if (t.dt !== 2 || !filters.categories.has(t.dc)) return false;
+    }
+    if (filters.stopIds) {
+      if (!filters.stopIds.has(t.s)) return false;
+    }
+    return true;
+  });
+}
+function aggregateHexCounts(trips, field) {
+  const counts = {};
+  for (const t of trips) {
+    const val = t[field];
+    if (!val) continue;
+    if (Array.isArray(val)) { for (const c of val) counts[c] = (counts[c] || 0) + 1; }
+    else { counts[val] = (counts[val] || 0) + 1; }
+  }
+  return counts;
+}
+function topBy(trips, field, n) {
+  n = n || 8;
+  const counts = {};
+  for (const t of trips) {
+    const val = t[field];
+    if (val === undefined || val === null) continue;
+    counts[val] = (counts[val] || 0) + 1;
+  }
+  return Object.entries(counts).sort((a, b) => b[1] - a[1]).slice(0, n);
+}
+function headlineStats(trips) {
+  const n = trips.length;
+  const walking = trips.filter(t => t.m === 0).length;
+  const home = trips.filter(t => t.dt === 0).length;
+  const work = trips.filter(t => t.dt === 1).length;
+  const errand = trips.filter(t => t.dt === 2).length;
+  return { n, walking, home, work, errand, pctWalking: n ? (100 * walking / n) : 0 };
+}
+function pointInPolygon(lat, lon, ring) {
+  // ring: array of [lat, lon]. Standard ray-casting test.
+  let inside = false;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const yi = ring[i][0], xi = ring[i][1], yj = ring[j][0], xj = ring[j][1];
+    const intersect = ((yi > lat) !== (yj > lat)) &&
+      (lon < (xj - xi) * (lat - yi) / (yj - yi) + xi);
+    if (intersect) inside = !inside;
+  }
+  return inside;
+}
+
+// ---------- App state ----------
+const state = {
+  pullId: null, trips: [], stops: [], routes: [], categories: [], zips: null,
+  stopById: {}, filters: { route: '', stop: '', mode: 'all', categories: new Set(), stopIds: null },
+  lassoActive: false, drawnLayer: null,
+};
+
+const MODE_COLORS = ['#00b39f', '#3d6bff', '#ff3d7f']; // walk, car, bike
+const MODE_LABELS = ['Walking', 'Car', 'Biking'];
+
+const map = L.map('map', { zoomControl: true }).setView([31.77, -106.49], 12);
+L.tileLayer('https://services.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Base/MapServer/tile/{z}/{y}/{x}', {
+  attribution: '&copy; Esri &mdash; Esri, HERE, Garmin, USGS', maxZoom: 16,
+}).addTo(map);
+L.tileLayer('https://services.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Reference/MapServer/tile/{z}/{y}/{x}', {
+  maxZoom: 16, pane: 'shadowPane',
+}).addTo(map);
+
+let pathLayer = L.layerGroup().addTo(map);
+let homeLayer = L.layerGroup().addTo(map);
+let workLayer = L.layerGroup();
+let destLayer = L.layerGroup().addTo(map);
+let stopMarkerLayer = L.layerGroup().addTo(map);
+
+const drawnItems = new L.FeatureGroup();
+map.addLayer(drawnItems);
+const drawControl = new L.Control.Draw({
+  draw: { polygon: true, polyline: false, rectangle: false, circle: false, marker: false, circlemarker: false },
+  edit: { featureGroup: drawnItems, remove: true },
+});
+
+document.getElementById('lasso-btn').addEventListener('click', () => {
+  const btn = document.getElementById('lasso-btn');
+  if (!state.lassoActive) {
+    map.addControl(drawControl);
+    new L.Draw.Polygon(map, drawControl.options.draw.polygon).enable();
+    btn.classList.add('active'); btn.textContent = '✏️ Click map to draw…';
+    state.lassoActive = true;
+  } else {
+    drawnItems.clearLayers();
+    state.filters.stopIds = null;
+    map.removeControl(drawControl);
+    btn.classList.remove('active'); btn.textContent = '✏️ Draw custom area';
+    state.lassoActive = false;
+    render();
+  }
+});
+map.on(L.Draw.Event.CREATED, (e) => {
+  drawnItems.clearLayers();
+  drawnItems.addLayer(e.layer);
+  const latlngs = e.layer.getLatLngs()[0].map(ll => [ll.lat, ll.lng]);
+  const inside = new Set();
+  state.stops.forEach(s => { if (pointInPolygon(s.lat, s.lon, latlngs)) inside.add(s.id); });
+  state.filters.stopIds = inside;
+  document.getElementById('zip-select').value = '';
+  const btn = document.getElementById('lasso-btn');
+  btn.classList.remove('active'); btn.textContent = '✏️ Draw custom area';
+  state.lassoActive = false;
+  map.removeControl(drawControl);
+  render();
+});
+
+// ---------- Data loading ----------
+async function loadManifest() {
+  const res = await fetch('data/manifest.json');
+  const manifest = await res.json();
+  const sel = document.getElementById('pull-select');
+  sel.innerHTML = '';
+  manifest.pulls.forEach(p => {
+    const opt = document.createElement('option');
+    opt.value = p.id;
+    opt.textContent = `${p.id} — ${p.n_trips.toLocaleString()} trips, ${p.n_stops} stops`;
+    sel.appendChild(opt);
+  });
+  sel.addEventListener('change', () => loadPull(sel.value));
+  if (manifest.pulls.length) loadPull(manifest.pulls[0].id);
+}
+
+async function loadPull(pullId) {
+  state.pullId = pullId;
+  const base = `data/${pullId}/`;
+  const [trips, stops, routes, categories] = await Promise.all([
+    fetch(base + 'trips.json').then(r => r.json()),
+    fetch(base + 'stops.json').then(r => r.json()),
+    fetch(base + 'routes.json').then(r => r.json()),
+    fetch(base + 'categories.json').then(r => r.json()),
+  ]);
+  state.trips = trips; state.stops = stops; state.routes = routes; state.categories = categories;
+  state.stopById = {}; stops.forEach(s => state.stopById[s.id] = s);
+  state.zips = null;
+  try {
+    const zr = await fetch(base + 'zips.geojson');
+    if (zr.ok) state.zips = await zr.json();
+  } catch (e) { /* no zips this pull -- fine */ }
+
+  populateRouteSelect(); populateStopSelect(); populateCategoryPills(); populateZipSelect();
+  state.filters = { route: '', stop: '', mode: 'all', categories: new Set(), stopIds: null };
+  drawnItems.clearLayers();
+  renderStopMarkers();
+  render();
+}
+
+function populateRouteSelect() {
+  const sel = document.getElementById('route-select');
+  sel.innerHTML = '<option value="">All routes</option>';
+  state.routes.sort((a, b) => b.n_riders - a.n_riders).forEach(r => {
+    const opt = document.createElement('option');
+    opt.value = r.route; opt.textContent = `Route ${r.route} (${r.n_riders} riders)`;
+    sel.appendChild(opt);
+  });
+  sel.onchange = () => {
+    state.filters.route = sel.value;
+    populateStopSelect();
+    render();
+  };
+}
+function populateStopSelect() {
+  const sel = document.getElementById('stop-select');
+  sel.innerHTML = '<option value="">All stops</option>';
+  const stops = state.filters.route
+    ? state.stops.filter(s => s.routes.includes(state.filters.route))
+    : state.stops;
+  stops.sort((a, b) => b.n_riders - a.n_riders).forEach(s => {
+    const opt = document.createElement('option');
+    opt.value = s.id; opt.textContent = `${s.address || s.id} (${s.n_riders})`;
+    sel.appendChild(opt);
+  });
+  sel.onchange = () => { state.filters.stop = sel.value; render(); };
+}
+function populateCategoryPills() {
+  const wrap = document.getElementById('category-pills');
+  wrap.innerHTML = '';
+  state.categories.slice(0, 14).forEach(c => {
+    const pill = document.createElement('div');
+    pill.className = 'pill'; pill.textContent = `${c.category} (${c.n_trips})`;
+    pill.onclick = () => {
+      if (state.filters.categories.has(c.category)) { state.filters.categories.delete(c.category); pill.classList.remove('active'); }
+      else { state.filters.categories.add(c.category); pill.classList.add('active'); }
+      render();
+    };
+    wrap.appendChild(pill);
+  });
+}
+function populateZipSelect() {
+  const sel = document.getElementById('zip-select');
+  sel.innerHTML = '<option value="">All zips</option>';
+  if (!state.zips) { sel.disabled = true; return; }
+  sel.disabled = false;
+  const zctas = [...new Set(state.zips.features.map(f => f.properties.ZCTA5))].sort();
+  zctas.forEach(z => {
+    const opt = document.createElement('option'); opt.value = z; opt.textContent = z; sel.appendChild(opt);
+  });
+  sel.onchange = () => {
+    if (!sel.value) { state.filters.stopIds = null; render(); return; }
+    const feature = state.zips.features.find(f => f.properties.ZCTA5 === sel.value);
+    const ring = feature.geometry.coordinates[0].map(([lon, lat]) => [lat, lon]);
+    const inside = new Set();
+    state.stops.forEach(s => { if (pointInPolygon(s.lat, s.lon, ring)) inside.add(s.id); });
+    state.filters.stopIds = inside;
+    drawnItems.clearLayers();
+    render();
+  };
+}
+
+document.getElementById('mode-pills').addEventListener('click', (e) => {
+  const el = e.target.closest('.pill'); if (!el) return;
+  document.querySelectorAll('#mode-pills .pill').forEach(p => p.classList.remove('active', 'mode-active-all', 'mode-active-walk', 'mode-active-car', 'mode-active-bike'));
+  const mode = el.dataset.mode;
+  state.filters.mode = mode === 'all' ? 'all' : parseInt(mode, 10);
+  el.classList.add('active');
+  el.classList.add(mode === 'all' ? 'mode-active-all' : ['mode-active-walk', 'mode-active-car', 'mode-active-bike'][mode]);
+  render();
+});
+document.getElementById('clear-filters').addEventListener('click', () => {
+  state.filters = { route: '', stop: '', mode: 'all', categories: new Set(), stopIds: null };
+  document.getElementById('route-select').value = '';
+  document.getElementById('stop-select').value = '';
+  document.getElementById('zip-select').value = '';
+  document.querySelectorAll('.pill').forEach(p => p.classList.remove('active', 'mode-active-walk', 'mode-active-car', 'mode-active-bike'));
+  document.querySelector('#mode-pills .pill[data-mode="all"]').classList.add('active', 'mode-active-all');
+  drawnItems.clearLayers();
+  populateStopSelect();
+  render();
+});
+['toggle-paths', 'toggle-home', 'toggle-work', 'toggle-dest'].forEach(id => {
+  document.getElementById(id).addEventListener('change', renderMapLayers);
+});
+
+// ---------- Rendering ----------
+function renderStopMarkers() {
+  stopMarkerLayer.clearLayers();
+  state.stops.forEach(s => {
+    L.circleMarker([s.lat, s.lon], { radius: 3, color: '#141414', weight: 1, fillOpacity: 0.5 })
+      .bindTooltip(`${s.address || s.id} — ${s.n_riders} riders`)
+      .addTo(stopMarkerLayer);
+  });
+}
+
+function hexToPolygonLatLng(cell) {
+  const boundary = h3.cellToBoundary(cell); // [[lat,lon], ...]
+  return boundary;
+}
+
+function renderMapLayers() {
+  const filtered = filterTrips(state.trips, state.filters, state.stopById);
+  pathLayer.clearLayers(); homeLayer.clearLayers(); workLayer.clearLayers(); destLayer.clearLayers();
+
+  if (document.getElementById('toggle-paths').checked) {
+    const pathCounts = aggregateHexCounts(filtered, 'ph');
+    const maxC = Math.max(1, ...Object.values(pathCounts));
+    for (const [cell, count] of Object.entries(pathCounts)) {
+      const ring = hexToPolygonLatLng(cell);
+      L.polygon(ring, {
+        color: '#ff3d7f', weight: 0, fillOpacity: 0.15 + 0.65 * (count / maxC), fillColor: '#ff3d7f',
+      }).bindTooltip(`${count} trip(s)`).addTo(pathLayer);
+    }
+  }
+  if (document.getElementById('toggle-home').checked) {
+    const homeCounts = aggregateHexCounts(filtered, 'hh');
+    const maxC = Math.max(1, ...Object.values(homeCounts));
+    for (const [cell, count] of Object.entries(homeCounts)) {
+      const ring = hexToPolygonLatLng(cell);
+      L.polygon(ring, {
+        color: '#00b39f', weight: 0, fillOpacity: 0.12 + 0.6 * (count / maxC), fillColor: '#00b39f',
+      }).bindTooltip(`${count} rider(s) live here`).addTo(homeLayer);
+    }
+  }
+  if (document.getElementById('toggle-work').checked) {
+    const workCounts = aggregateHexCounts(filtered, 'wh');
+    const maxC = Math.max(1, ...Object.values(workCounts));
+    for (const [cell, count] of Object.entries(workCounts)) {
+      const ring = hexToPolygonLatLng(cell);
+      L.polygon(ring, {
+        color: '#3d6bff', weight: 0, fillOpacity: 0.12 + 0.6 * (count / maxC), fillColor: '#3d6bff',
+      }).bindTooltip(`${count} rider(s) work here`).addTo(workLayer);
+    }
+  }
+  if (document.getElementById('toggle-dest').checked) {
+    const places = {};
+    filtered.filter(t => t.dt === 2 && t.dlat != null).forEach(t => {
+      const key = t.dn + '|' + t.dlat + '|' + t.dlon;
+      if (!places[key]) places[key] = { name: t.dn, category: t.dc, lat: t.dlat, lon: t.dlon, n: 0 };
+      places[key].n += 1;
+    });
+    const maxN = Math.max(1, ...Object.values(places).map(p => p.n));
+    Object.values(places).forEach(p => {
+      L.circleMarker([p.lat, p.lon], {
+        radius: 4 + 12 * Math.sqrt(p.n / maxN), color: '#141414', weight: 1, fillColor: '#f4e600', fillOpacity: 0.85,
+      }).bindTooltip(`${p.name} — ${p.n} trip(s)<br>${p.category || ''}`).addTo(destLayer);
+    });
+  }
+  if (document.getElementById('toggle-home').checked) map.addLayer(homeLayer); else map.removeLayer(homeLayer);
+  if (document.getElementById('toggle-work').checked) map.addLayer(workLayer); else map.removeLayer(workLayer);
+}
+
+function renderBarChart(containerId, entries, labelFn) {
+  const el = document.getElementById(containerId);
+  el.innerHTML = '';
+  if (!entries.length) { el.innerHTML = '<div style="font-size:11px;color:#8b8578;">No data for this selection</div>'; return; }
+  const max = entries[0][1];
+  entries.forEach(([key, val]) => {
+    const row = document.createElement('div'); row.className = 'bar-row';
+    const label = document.createElement('div'); label.className = 'bar-label'; label.textContent = labelFn ? labelFn(key) : key; label.title = label.textContent;
+    const track = document.createElement('div'); track.className = 'bar-track';
+    const fill = document.createElement('div'); fill.className = 'bar-fill'; fill.style.width = (100 * val / max) + '%';
+    track.appendChild(fill);
+    const valEl = document.createElement('div'); valEl.className = 'bar-val'; valEl.textContent = val;
+    row.appendChild(label); row.appendChild(track); row.appendChild(valEl);
+    el.appendChild(row);
+  });
+}
+
+function render() {
+  const filtered = filterTrips(state.trips, state.filters, state.stopById);
+  const stats = headlineStats(filtered);
+  document.getElementById('stat-n').textContent = stats.n.toLocaleString();
+  document.getElementById('stat-walk').textContent = stats.pctWalking.toFixed(0) + '%';
+  document.getElementById('stat-home').textContent = stats.home.toLocaleString();
+  document.getElementById('stat-work').textContent = stats.work.toLocaleString();
+  document.getElementById('stat-errand').textContent = stats.errand.toLocaleString();
+  document.getElementById('stat-stops').textContent = new Set(filtered.map(t => t.s)).size;
+
+  renderMapLayers();
+  renderBarChart('chart-destinations', topBy(filtered.filter(t => t.dt === 2), 'dn', 8));
+  renderBarChart('chart-streets', topBy(filtered.filter(t => t.m === 0), 'st', 8));
+  renderBarChart('chart-modes', topBy(filtered, 'm', 3), (k) => MODE_LABELS[k] || 'Unknown');
+}
+
+loadManifest();
+</script>
+</body>
+</html>
