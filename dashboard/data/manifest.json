@@ -1,0 +1,12 @@
+{
+  "pulls": [
+    {
+      "id": "10169459",
+      "n_trips": 304607,
+      "n_stops": 2164,
+      "n_routes": 52,
+      "n_walking": 36728,
+      "has_zips": false
+    }
+  ]
+}
