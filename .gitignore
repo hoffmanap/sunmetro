@@ -1,3 +1,4 @@
-pulls/*/raw/ 
-*.tsv.gz 
-*.zip 
+pulls/*/raw/
+*.tsv
+*.tsv.gz
+*.zip
