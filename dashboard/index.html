@@ -75,6 +75,13 @@
   .bar-track{flex:1;height:14px;background:var(--line);border-radius:3px;overflow:hidden;}
   .bar-fill{height:100%;background:var(--pink);}
   .bar-val{width:34px;text-align:right;flex-shrink:0;font-weight:700;font-variant-numeric:tabular-nums;}
+  .bar-row.clickable{cursor:pointer;}
+  .bar-row.clickable:hover .bar-label{text-decoration:underline;}
+  .bar-row.selected .bar-label{color:var(--pink);}
+  .chart-search{width:100%;padding:5px 8px;font-size:11px;border:2px solid var(--ink);border-radius:5px;margin-bottom:8px;font-family:inherit;}
+  .chart-list{max-height:150px;overflow-y:auto;}
+  .chart-list.expanded{max-height:340px;}
+  .chart-showmore{font-size:11px;font-weight:700;color:var(--pink);cursor:pointer;margin-top:4px;text-decoration:underline;}
 
   .leaflet-popup-content{font-size:12px;font-family:inherit;}
   #legend{position:absolute;bottom:14px;left:14px;background:rgba(255,255,255,.94);
@@ -124,8 +131,9 @@
       <div class="pill-row" id="category-pills"></div>
     </div>
     <div class="section">
-      <h3>Zip code</h3>
-      <select id="zip-select"><option value="">All zips</option></select>
+      <h3>Rider home zip code</h3>
+      <select id="zip-select"><option value="">All home zips</option></select>
+      <div style="font-size:10px;color:#8b8578;margin-top:4px;">Filters to trips by riders who LIVE in the selected zip (not where the stop is).</div>
     </div>
     <div class="section">
       <h3>Draw an area</h3>
@@ -136,7 +144,7 @@
 
   <div id="map-wrap"><div id="map"></div>
     <div id="legend">
-      <div class="layer-toggle"><input type="checkbox" id="toggle-paths" checked><span class="swatch" style="background:#ff3d7f"></span>Walked paths (fine)</div>
+      <div class="layer-toggle"><input type="checkbox" id="toggle-paths" checked><span class="swatch" style="background:#ff3d7f"></span>Walked streets</div>
       <div class="layer-toggle"><input type="checkbox" id="toggle-home" checked><span class="swatch" style="background:#00b39f"></span>Home areas</div>
       <div class="layer-toggle"><input type="checkbox" id="toggle-work"><span class="swatch" style="background:#3d6bff"></span>Work areas</div>
       <div class="layer-toggle"><input type="checkbox" id="toggle-dest" checked><span class="swatch" style="background:#f4e600;border:1px solid #141414"></span>Destinations</div>
@@ -144,8 +152,18 @@
   </div>
 
   <div id="sidebar-right">
-    <div class="chart-block"><h3>Top destinations</h3><div id="chart-destinations"></div></div>
-    <div class="chart-block"><h3>Top streets walked</h3><div id="chart-streets"></div></div>
+    <div class="chart-block">
+      <h3>Top destinations</h3>
+      <input type="text" class="chart-search" id="search-destinations" placeholder="Search destinations…">
+      <div id="chart-destinations" class="chart-list"></div>
+      <div class="chart-showmore" id="showmore-destinations"></div>
+    </div>
+    <div class="chart-block">
+      <h3>Top streets walked</h3>
+      <input type="text" class="chart-search" id="search-streets" placeholder="Search streets…">
+      <div id="chart-streets" class="chart-list"></div>
+      <div class="chart-showmore" id="showmore-streets"></div>
+    </div>
     <div class="chart-block"><h3>Mode split</h3><div id="chart-modes"></div></div>
   </div>
 </div>
@@ -163,6 +181,9 @@ function filterTrips(trips, filters, stopById) {
     if (filters.stopIds) {
       if (!filters.stopIds.has(t.s)) return false;
     }
+    if (filters.homeZip && t.hz !== filters.homeZip) return false;
+    if (filters.destinationName && t.dn !== filters.destinationName) return false;
+    if (filters.streetName && t.st !== filters.streetName) return false;
     return true;
   });
 }
@@ -208,13 +229,35 @@ function pointInPolygon(lat, lon, ring) {
 
 // ---------- App state ----------
 const state = {
-  pullId: null, trips: [], stops: [], routes: [], categories: [], zips: null,
-  stopById: {}, filters: { route: '', stop: '', mode: 'all', categories: new Set(), stopIds: null },
+  pullId: null, trips: [], stops: [], routes: [], categories: [], zips: null, streetGeom: {},
+  stopById: {},
+  filters: { route: '', stop: '', mode: 'all', categories: new Set(), stopIds: null, homeZip: '', destinationName: '', streetName: '' },
   lassoActive: false, drawnLayer: null,
 };
 
 const MODE_COLORS = ['#00b39f', '#3d6bff', '#ff3d7f']; // walk, car, bike
 const MODE_LABELS = ['Walking', 'Car', 'Biking'];
+
+// Sequential 5-class color ramps (ColorBrewer-style) for the home/work
+// choropleth layers -- a single opacity ramp on one color reads as "2
+// levels" to the eye; distinct hues per class are what makes density
+// actually legible.
+const HOME_RAMP = ['#d3f5ef', '#8fe3d3', '#45c4ab', '#00967f', '#005c4d'];
+const WORK_RAMP = ['#dbe6ff', '#a7c0ff', '#6f92ff', '#3d6bff', '#1f3fb0'];
+
+function quantileBreaks(values, nClasses) {
+  const sorted = [...values].sort((a, b) => a - b);
+  const breaks = [];
+  for (let i = 1; i < nClasses; i++) {
+    const idx = Math.floor((i / nClasses) * sorted.length);
+    breaks.push(sorted[Math.min(idx, sorted.length - 1)]);
+  }
+  return breaks;
+}
+function classify(value, breaks) {
+  for (let i = 0; i < breaks.length; i++) { if (value <= breaks[i]) return i; }
+  return breaks.length;
+}
 
 const map = L.map('map', { zoomControl: true }).setView([31.77, -106.49], 12);
 L.tileLayer('https://services.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Base/MapServer/tile/{z}/{y}/{x}', {
@@ -301,8 +344,17 @@ async function loadPull(pullId) {
     if (zr.ok) state.zips = await zr.json();
   } catch (e) { /* no zips this pull -- fine */ }
 
+  state.streetGeom = {};
+  try {
+    const sr = await fetch(base + 'streets.geojson');
+    if (sr.ok) {
+      const sdata = await sr.json();
+      sdata.features.forEach(f => { state.streetGeom[f.properties.name] = f.geometry.coordinates; });
+    }
+  } catch (e) { /* no street geometry this pull -- the streets layer just won't draw */ }
+
   populateRouteSelect(); populateStopSelect(); populateCategoryPills(); populateZipSelect();
-  state.filters = { route: '', stop: '', mode: 'all', categories: new Set(), stopIds: null };
+  state.filters = { route: '', stop: '', mode: 'all', categories: new Set(), stopIds: null, homeZip: '', destinationName: '', streetName: '' };
   drawnItems.clearLayers();
   renderStopMarkers();
   render();
@@ -351,21 +403,19 @@ function populateCategoryPills() {
 }
 function populateZipSelect() {
   const sel = document.getElementById('zip-select');
-  sel.innerHTML = '<option value="">All zips</option>';
+  sel.innerHTML = '<option value="">All home zips</option>';
   if (!state.zips) { sel.disabled = true; return; }
   sel.disabled = false;
-  const zctas = [...new Set(state.zips.features.map(f => f.properties.ZCTA5))].sort();
-  zctas.forEach(z => {
-    const opt = document.createElement('option'); opt.value = z; opt.textContent = z; sel.appendChild(opt);
+  // Only list zips that actually have riders living there (from trips'
+  // own 'hz' field, precomputed at build time), not every ZCTA the
+  // Census bbox fetch happened to return -- most of those would be empty.
+  const zipCounts = {};
+  state.trips.forEach(t => { if (t.hz) zipCounts[t.hz] = (zipCounts[t.hz] || 0) + 1; });
+  Object.keys(zipCounts).sort().forEach(z => {
+    const opt = document.createElement('option'); opt.value = z; opt.textContent = `${z} (${zipCounts[z]} riders)`; sel.appendChild(opt);
   });
   sel.onchange = () => {
-    if (!sel.value) { state.filters.stopIds = null; render(); return; }
-    const feature = state.zips.features.find(f => f.properties.ZCTA5 === sel.value);
-    const ring = feature.geometry.coordinates[0].map(([lon, lat]) => [lat, lon]);
-    const inside = new Set();
-    state.stops.forEach(s => { if (pointInPolygon(s.lat, s.lon, ring)) inside.add(s.id); });
-    state.filters.stopIds = inside;
-    drawnItems.clearLayers();
+    state.filters.homeZip = sel.value;
     render();
   };
 }
@@ -380,10 +430,14 @@ document.getElementById('mode-pills').addEventListener('click', (e) => {
   render();
 });
 document.getElementById('clear-filters').addEventListener('click', () => {
-  state.filters = { route: '', stop: '', mode: 'all', categories: new Set(), stopIds: null };
+  state.filters = { route: '', stop: '', mode: 'all', categories: new Set(), stopIds: null, homeZip: '', destinationName: '', streetName: '' };
   document.getElementById('route-select').value = '';
   document.getElementById('stop-select').value = '';
   document.getElementById('zip-select').value = '';
+  document.getElementById('search-destinations').value = '';
+  document.getElementById('search-streets').value = '';
+  listUiState.destinations = { expanded: false, search: '' };
+  listUiState.streets = { expanded: false, search: '' };
   document.querySelectorAll('.pill').forEach(p => p.classList.remove('active', 'mode-active-walk', 'mode-active-car', 'mode-active-bike'));
   document.querySelector('#mode-pills .pill[data-mode="all"]').classList.add('active', 'mode-active-all');
   drawnItems.clearLayers();
@@ -414,32 +468,44 @@ function renderMapLayers() {
   pathLayer.clearLayers(); homeLayer.clearLayers(); workLayer.clearLayers(); destLayer.clearLayers();
 
   if (document.getElementById('toggle-paths').checked) {
-    const pathCounts = aggregateHexCounts(filtered, 'ph');
-    const maxC = Math.max(1, ...Object.values(pathCounts));
-    for (const [cell, count] of Object.entries(pathCounts)) {
-      const ring = hexToPolygonLatLng(cell);
-      L.polygon(ring, {
-        color: '#ff3d7f', weight: 0, fillOpacity: 0.15 + 0.65 * (count / maxC), fillColor: '#ff3d7f',
-      }).bindTooltip(`${count} trip(s)`).addTo(pathLayer);
-    }
+    // Actual polylines along the real street geometry, weighted by trip
+    // count -- replaces the earlier fine-hexbin dots, which were only
+    // visible zoomed in extremely close and easy to mistake for "no path
+    // data" at any normal city-wide view.
+    const streetCounts = topBy(filtered.filter(t => t.m === 0 && t.st), 'st', 100000);
+    const maxC = streetCounts.length ? streetCounts[0][1] : 1;
+    streetCounts.forEach(([name, count]) => {
+      const lines = state.streetGeom[name];
+      if (!lines) return;
+      lines.forEach(line => {
+        const latlngs = line.map(([lon, lat]) => [lat, lon]);
+        L.polyline(latlngs, {
+          color: '#ff3d7f', weight: 2 + 6 * (count / maxC), opacity: 0.5 + 0.45 * (count / maxC),
+        }).bindTooltip(`${name} — ${count} trip(s)`).addTo(pathLayer);
+      });
+    });
   }
   if (document.getElementById('toggle-home').checked) {
     const homeCounts = aggregateHexCounts(filtered, 'hh');
-    const maxC = Math.max(1, ...Object.values(homeCounts));
+    const values = Object.values(homeCounts);
+    const breaks = quantileBreaks(values, HOME_RAMP.length);
     for (const [cell, count] of Object.entries(homeCounts)) {
       const ring = hexToPolygonLatLng(cell);
+      const cls = classify(count, breaks);
       L.polygon(ring, {
-        color: '#00b39f', weight: 0, fillOpacity: 0.12 + 0.6 * (count / maxC), fillColor: '#00b39f',
+        color: HOME_RAMP[cls], weight: 0, fillOpacity: 0.75, fillColor: HOME_RAMP[cls],
       }).bindTooltip(`${count} rider(s) live here`).addTo(homeLayer);
     }
   }
   if (document.getElementById('toggle-work').checked) {
     const workCounts = aggregateHexCounts(filtered, 'wh');
-    const maxC = Math.max(1, ...Object.values(workCounts));
+    const values = Object.values(workCounts);
+    const breaks = quantileBreaks(values, WORK_RAMP.length);
     for (const [cell, count] of Object.entries(workCounts)) {
       const ring = hexToPolygonLatLng(cell);
+      const cls = classify(count, breaks);
       L.polygon(ring, {
-        color: '#3d6bff', weight: 0, fillOpacity: 0.12 + 0.6 * (count / maxC), fillColor: '#3d6bff',
+        color: WORK_RAMP[cls], weight: 0, fillOpacity: 0.75, fillColor: WORK_RAMP[cls],
       }).bindTooltip(`${count} rider(s) work here`).addTo(workLayer);
     }
   }
@@ -478,6 +544,62 @@ function renderBarChart(containerId, entries, labelFn) {
   });
 }
 
+// UI-only state (search text / expanded state) for the two searchable
+// panels -- kept separate from state.filters so typing a search doesn't
+// get wiped out by an unrelated filter change elsewhere.
+const listUiState = {
+  destinations: { expanded: false, search: '' },
+  streets: { expanded: false, search: '' },
+};
+
+function renderExpandableList(uiKey, listContainerId, showMoreId, allEntries, filterField, selectedValue) {
+  const ui = listUiState[uiKey];
+  const listEl = document.getElementById(listContainerId);
+  const moreEl = document.getElementById(showMoreId);
+  let entries = allEntries;
+  if (ui.search) {
+    const q = ui.search.toLowerCase();
+    entries = entries.filter(([k]) => String(k).toLowerCase().includes(q));
+  }
+  const shown = ui.expanded ? entries : entries.slice(0, 8);
+  listEl.className = 'chart-list' + (ui.expanded ? ' expanded' : '');
+  listEl.innerHTML = '';
+  if (!shown.length) {
+    listEl.innerHTML = '<div style="font-size:11px;color:#8b8578;">No matches</div>';
+  } else {
+    const max = entries[0][1];
+    shown.forEach(([key, val]) => {
+      const row = document.createElement('div');
+      row.className = 'bar-row clickable' + (key === selectedValue ? ' selected' : '');
+      const label = document.createElement('div'); label.className = 'bar-label'; label.textContent = key; label.title = key;
+      const track = document.createElement('div'); track.className = 'bar-track';
+      const fill = document.createElement('div'); fill.className = 'bar-fill'; fill.style.width = (100 * val / max) + '%';
+      track.appendChild(fill);
+      const valEl = document.createElement('div'); valEl.className = 'bar-val'; valEl.textContent = val;
+      row.appendChild(label); row.appendChild(track); row.appendChild(valEl);
+      row.onclick = () => {
+        state.filters[filterField] = (state.filters[filterField] === key) ? '' : key;
+        render();
+      };
+      listEl.appendChild(row);
+    });
+  }
+  if (entries.length > 8) {
+    moreEl.style.display = '';
+    moreEl.textContent = ui.expanded ? '← Show top 8 only' : `Show all ${entries.length} →`;
+    moreEl.onclick = () => { ui.expanded = !ui.expanded; render(); };
+  } else {
+    moreEl.style.display = 'none';
+  }
+}
+
+document.getElementById('search-destinations').addEventListener('input', (e) => {
+  listUiState.destinations.search = e.target.value; render();
+});
+document.getElementById('search-streets').addEventListener('input', (e) => {
+  listUiState.streets.search = e.target.value; render();
+});
+
 function render() {
   const filtered = filterTrips(state.trips, state.filters, state.stopById);
   const stats = headlineStats(filtered);
@@ -489,8 +611,10 @@ function render() {
   document.getElementById('stat-stops').textContent = new Set(filtered.map(t => t.s)).size;
 
   renderMapLayers();
-  renderBarChart('chart-destinations', topBy(filtered.filter(t => t.dt === 2), 'dn', 8));
-  renderBarChart('chart-streets', topBy(filtered.filter(t => t.m === 0), 'st', 8));
+  renderExpandableList('destinations', 'chart-destinations', 'showmore-destinations',
+                        topBy(filtered.filter(t => t.dt === 2), 'dn', 100000), 'destinationName', state.filters.destinationName);
+  renderExpandableList('streets', 'chart-streets', 'showmore-streets',
+                        topBy(filtered.filter(t => t.m === 0 && t.st), 'st', 100000), 'streetName', state.filters.streetName);
   renderBarChart('chart-modes', topBy(filtered, 'm', 3), (k) => MODE_LABELS[k] || 'Unknown');
 }
 
