@@ -97,7 +97,13 @@ def fetch_zcta_boundaries(bbox: tuple, cache_path: Path) -> dict | None:
     2020 Census Blocks layer and has no ZCTA5 field at all; it was failing
     silently every time (returning nothing, so the dashboard's zip filter
     just looked broken). Verified live against a real El Paso bbox before
-    shipping this fix -- 17 real ZCTA polygons with correct ZCTA5 values."""
+    shipping this fix -- 17 real ZCTA polygons with correct ZCTA5 values.
+
+    A metro-wide bbox (riders' homes can be scattered across the whole
+    area, not just near stops) is a big enough query that TIGERweb has been
+    seen to time out at 60s under load -- retries with a longer timeout
+    before giving up, same pattern already used for the Overpass street
+    fetch."""
     if cache_path.exists():
         log.info("  using cached zip boundaries at %s", cache_path)
         return json.load(open(cache_path))
@@ -108,20 +114,27 @@ def fetch_zcta_boundaries(bbox: tuple, cache_path: Path) -> dict | None:
         "geometryType": "esriGeometryEnvelope", "inSR": "4326", "spatialRel": "esriSpatialRelIntersects",
         "outFields": "ZCTA5,BASENAME", "outSR": "4326", "f": "geojson",
     }
-    try:
-        resp = requests.get(url, params=params, timeout=60)
-        resp.raise_for_status()
-        data = resp.json()
-        if not data.get("features"):
-            log.warning("  TIGERweb returned no ZCTA features for this bbox -- zip filter will be unavailable.")
-            return None
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        json.dump(data, open(cache_path, "w"))
-        log.info("  fetched %d zip boundaries, cached to %s", len(data["features"]), cache_path)
-        return data
-    except Exception as e:
-        log.warning("  Could not fetch zip boundaries (%s) -- zip filter will be unavailable this run.", e)
-        return None
+    last_error = None
+    for attempt, timeout in enumerate([60, 120, 180]):
+        try:
+            log.info("  querying TIGERweb for ZCTA boundaries (attempt %d, timeout %ds) ...", attempt + 1, timeout)
+            resp = requests.get(url, params=params, timeout=timeout)
+            resp.raise_for_status()
+            data = resp.json()
+            if not data.get("features"):
+                log.warning("  TIGERweb returned no ZCTA features for this bbox -- zip filter will be unavailable.")
+                return None
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            json.dump(data, open(cache_path, "w"))
+            log.info("  fetched %d zip boundaries, cached to %s", len(data["features"]), cache_path)
+            return data
+        except Exception as e:
+            last_error = e
+            log.info("    attempt %d failed (%s), %s", attempt + 1, e,
+                      "retrying with a longer timeout ..." if attempt < 2 else "giving up.")
+    log.warning("  Could not fetch zip boundaries after 3 attempts (%s) -- zip filter will be unavailable this run.",
+                last_error)
+    return None
 
 
 def build_zip_lookup(zips_geojson: dict):
@@ -148,6 +161,9 @@ def parse_args(argv=None):
     p.add_argument("--trips", required=True, help="trip_destinations.csv")
     p.add_argument("--vehicle", required=True, help="vehicle_departures.csv")
     p.add_argument("--walking-paths", required=True, help="walking_paths.geojson")
+    p.add_argument("--vehicle-paths", default=None,
+                    help="vehicle_paths.geojson from trace_departures_and_destinations.py (optional -- older "
+                         "pipeline runs won't have this; car/biking trips just won't get street/path data without it).")
     p.add_argument("--stops", required=True, help="bus_stops_clustered.csv")
     p.add_argument("--dwell-confirmed-only", action="store_true", default=True,
                     help="Only include walking trips with a confirmed arrival dwell (default: on).")
@@ -174,7 +190,29 @@ def main(argv=None):
     log.info("Loading riders (home/work lookup) from %s ...", args.riders)
     riders = pd.read_csv(args.riders)
     riders["device_id"] = riders["device_id"].astype(str)
-    riders_lookup = riders.set_index(["device_id", "stop_id"])[["home_lat", "home_lon", "work_lat", "work_lon"]]
+    # home_zip/work_zip are present if analyze_bus_rider_home_work.py was run
+    # with an updated version that captures the CEL/CDL export's own postal
+    # code field -- a real device-reported zip, not a reverse-geocoded
+    # guess, so no external boundary fetch is needed at all for this. Older
+    # rider_stop_assignments.csv files won't have these columns; handled
+    # gracefully below.
+    lookup_cols = ["home_lat", "home_lon", "work_lat", "work_lon"]
+    has_reported_zip = "home_zip" in riders.columns
+    if has_reported_zip:
+        lookup_cols.append("home_zip")
+        # Pandas infers an all-numeric-looking zip column as float64, which
+        # turns "79936" into 79936.0 and then, when stringified, "79936.0"
+        # -- fixed at the STRING level (not by round-tripping through int)
+        # so a zip that genuinely has a leading zero elsewhere in the
+        # country (e.g. "02139") isn't corrupted by dropping it.
+        riders["home_zip"] = riders["home_zip"].astype(str).str.replace(r"\.0$", "", regex=True)
+        riders.loc[riders["home_zip"].isin(["nan", "None"]), "home_zip"] = None
+        log.info("  rider_stop_assignments.csv has a reported home_zip column -- using it directly.")
+    else:
+        log.info("  no home_zip column in rider_stop_assignments.csv (older pipeline run) -- "
+                  "the zip filter will be unavailable this run. Re-run analyze_bus_rider_home_work.py "
+                  "with the current version to get it.")
+    riders_lookup = riders.set_index(["device_id", "stop_id"])[lookup_cols]
 
     log.info("Loading walking trips from %s ...", args.trips)
     trips = pd.read_csv(args.trips)
@@ -200,6 +238,19 @@ def main(argv=None):
         for f in paths_data["features"]
     }
 
+    # Vehicle (car/biking) departure paths -- optional, since older pipeline
+    # runs won't have this file. Merged into the SAME path_by_key lookup so
+    # every downstream step (fine hex, street snap) treats them uniformly;
+    # only the destination-resolution logic (which never ran for vehicles)
+    # differs.
+    if args.vehicle_paths:
+        log.info("Loading vehicle departure paths from %s ...", args.vehicle_paths)
+        vpaths_data = json.load(open(args.vehicle_paths))
+        for f in vpaths_data["features"]:
+            key = f"{f['properties']['device_id']}||{f['properties']['stop_id']}"
+            path_by_key[key] = f["geometry"]["coordinates"]
+        log.info("  %d vehicle departure paths loaded.", len(vpaths_data["features"]))
+
     segments, grid, cell_deg = [], {}, 0.0003
     if not args.skip_streets:
         all_lats = [pt[1] for coords in path_by_key.values() for pt in coords]
@@ -215,30 +266,17 @@ def main(argv=None):
             except Exception as e:
                 log.warning("  Could not fetch OSM streets (%s) -- trips.json will have no street names this run.", e)
 
-    zip_lookup = None
-    if not args.skip_zips:
-        # Bbox for the zip fetch needs to cover every HOME/WORK location too,
-        # not just the stops/paths -- riders can live well outside the
-        # immediate stop area, which is the whole point of resolving home
-        # locations in the first place.
-        home_lats = riders["home_lat"].dropna().tolist() + riders["work_lat"].dropna().tolist()
-        home_lons = riders["home_lon"].dropna().tolist() + riders["work_lon"].dropna().tolist()
-        all_lats_zip = home_lats + stops["lat"].tolist()
-        all_lons_zip = home_lons + stops["lon"].tolist()
-        if all_lats_zip:
-            zbbox = (min(all_lons_zip) - 0.05, min(all_lats_zip) - 0.05, max(all_lons_zip) + 0.05, max(all_lats_zip) + 0.05)
-            cache_path = Path(args.out) / "_zips_cache" / f"{round(zbbox[0],2)}_{round(zbbox[1],2)}_{round(zbbox[2],2)}_{round(zbbox[3],2)}.geojson"
-            zips_data = fetch_zcta_boundaries(zbbox, cache_path)
-            if zips_data:
-                json.dump(zips_data, open(out_dir / "zips.geojson", "w"))
-                log.info("Wrote %s", out_dir / "zips.geojson")
-                zip_lookup = build_zip_lookup(zips_data)
+    # Zip code boundary fetch removed as the primary path for the zip
+    # filter -- the CEL/CDL export's OWN postal-code field (captured by
+    # analyze_bus_rider_home_work.py into home_zip, when present) is a real
+    # device-reported zip code, more reliable than reverse-geocoding lat/lon
+    # against an externally-fetched boundary service (which needed retries
+    # for a slow/flaky Census endpoint and only ever existed to support
+    # this one feature). --skip-zips is now a no-op kept for CLI compatibility.
 
     log.info("Building trip records ...")
     trip_records = []
     category_counts: Counter = Counter()
-    zip_cache: dict = {}  # keyed by home_hex -- avoids a separate point-in-polygon test per trip when many
-                           # trips share the same coarse home cell (common: multiple trips per rider)
     for _, r in trips.iterrows():
         key = f"{r['device_id']}||{r['stop_id']}"
         hw = riders_lookup.loc[(r["device_id"], r["stop_id"])] if (r["device_id"], r["stop_id"]) in riders_lookup.index else None
@@ -246,12 +284,8 @@ def main(argv=None):
             if hw is not None and pd.notna(hw.get("home_lat")) else None
         work_hex = h3.latlng_to_cell(hw["work_lat"], hw["work_lon"], args.coarse_hex_resolution) \
             if hw is not None and pd.notna(hw.get("work_lat")) else None
-
-        home_zip = None
-        if zip_lookup is not None and home_hex is not None:
-            if home_hex not in zip_cache:
-                zip_cache[home_hex] = zip_lookup(hw["home_lat"], hw["home_lon"])
-            home_zip = zip_cache[home_hex]
+        home_zip = hw.get("home_zip") if hw is not None and has_reported_zip else None
+        home_zip = None if pd.isna(home_zip) else str(home_zip)
 
         rec = {"s": r["stop_id"], "m": MODE_CODE["walking"], "dt": DEST_TYPE_CODE.get(r["destination_type"], 3),
                "hh": home_hex, "wh": work_hex, "hz": home_zip}
@@ -283,13 +317,23 @@ def main(argv=None):
             if hw is not None and pd.notna(hw.get("home_lat")) else None
         work_hex = h3.latlng_to_cell(hw["work_lat"], hw["work_lon"], args.coarse_hex_resolution) \
             if hw is not None and pd.notna(hw.get("work_lat")) else None
-        home_zip = None
-        if zip_lookup is not None and home_hex is not None:
-            if home_hex not in zip_cache:
-                zip_cache[home_hex] = zip_lookup(hw["home_lat"], hw["home_lon"])
-            home_zip = zip_cache[home_hex]
-        trip_records.append({"s": r["stop_id"], "m": MODE_CODE.get(r["departure_mode"], 1),
-                              "dt": 3, "hh": home_hex, "wh": work_hex, "hz": home_zip})
+        home_zip = hw.get("home_zip") if hw is not None and has_reported_zip else None
+        home_zip = None if pd.isna(home_zip) else str(home_zip)
+        rec = {"s": r["stop_id"], "m": MODE_CODE.get(r["departure_mode"], 1),
+               "dt": 3, "hh": home_hex, "wh": work_hex, "hz": home_zip}
+
+        coords = path_by_key.get(f"{r['device_id']}||{r['stop_id']}")
+        if coords:
+            rec["ph"] = build_fine_hex_path(coords, args.fine_hex_resolution)
+            if segments:
+                street_votes = Counter()
+                for lon, lat in coords:
+                    name = awp.snap_point_to_street(lat, lon, segments, grid, cell_deg, args.max_snap_m)
+                    if name:
+                        street_votes[name] += 1
+                if street_votes:
+                    rec["st"] = street_votes.most_common(1)[0][0]
+        trip_records.append(rec)
 
     trips_path = out_dir / "trips.json"
     with open(trips_path, "w") as fh:
