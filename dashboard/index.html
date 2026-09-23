@@ -234,7 +234,7 @@ function pointInPolygon(lat, lon, ring) {
 
 // ---------- App state ----------
 const state = {
-  pullId: null, trips: [], stops: [], routes: [], categories: [], zips: null, streetGeom: {},
+  pullId: null, trips: [], stops: [], routes: [], categories: [], streetGeom: {},
   stopById: {}, minTrips: 1,
   filters: { route: '', stop: '', mode: 'all', categories: new Set(), stopIds: null, homeZip: '', destinationName: '', streetName: '' },
   lassoActive: false, drawnLayer: null,
@@ -355,11 +355,6 @@ async function loadPull(pullId) {
   ]);
   state.trips = trips; state.stops = stops; state.routes = routes; state.categories = categories;
   state.stopById = {}; stops.forEach(s => state.stopById[s.id] = s);
-  state.zips = null;
-  try {
-    const zr = await fetch(base + 'zips.geojson');
-    if (zr.ok) state.zips = await zr.json();
-  } catch (e) { /* no zips this pull -- fine */ }
 
   state.streetGeom = {};
   try {
@@ -421,13 +416,16 @@ function populateCategoryPills() {
 function populateZipSelect() {
   const sel = document.getElementById('zip-select');
   sel.innerHTML = '<option value="">All home zips</option>';
-  if (!state.zips) { sel.disabled = true; return; }
-  sel.disabled = false;
-  // Only list zips that actually have riders living there (from trips'
-  // own 'hz' field, precomputed at build time), not every ZCTA the
-  // Census bbox fetch happened to return -- most of those would be empty.
+  // Built purely from trips' own 'hz' field (the device-reported zip code
+  // carried through the pipeline) -- this no longer depends on a fetched
+  // zips.geojson boundary file at all (that whole approach was dropped).
+  // The stale `if (!state.zips) return` guard that used to gate this on
+  // the old boundary fetch is exactly why the dropdown stayed empty even
+  // after trips.json had real zip data -- it returned before ever reading
+  // it.
   const zipCounts = {};
   state.trips.forEach(t => { if (t.hz) zipCounts[t.hz] = (zipCounts[t.hz] || 0) + 1; });
+  sel.disabled = Object.keys(zipCounts).length === 0;
   Object.keys(zipCounts).sort().forEach(z => {
     const opt = document.createElement('option'); opt.value = z; opt.textContent = `${z} (${zipCounts[z]} riders)`; sel.appendChild(opt);
   });
