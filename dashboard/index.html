@@ -136,6 +136,11 @@
       <div style="font-size:10px;color:#8b8578;margin-top:4px;">Filters to trips by riders who LIVE in the selected zip (not where the stop is).</div>
     </div>
     <div class="section">
+      <h3>Minimum trips to show <span id="min-trips-val" style="color:var(--pink);">1</span></h3>
+      <input type="range" id="min-trips-slider" min="1" max="30" value="1" style="width:100%;">
+      <div style="font-size:10px;color:#8b8578;margin-top:4px;">Hides low-count streets, hex cells, and destinations from the map and side lists -- raise this to cut through clutter and highlight only where activity concentrates.</div>
+    </div>
+    <div class="section">
       <h3>Draw an area</h3>
       <button id="lasso-btn">✏️ Draw custom area</button>
     </div>
@@ -230,7 +235,7 @@ function pointInPolygon(lat, lon, ring) {
 // ---------- App state ----------
 const state = {
   pullId: null, trips: [], stops: [], routes: [], categories: [], zips: null, streetGeom: {},
-  stopById: {},
+  stopById: {}, minTrips: 1,
   filters: { route: '', stop: '', mode: 'all', categories: new Set(), stopIds: null, homeZip: '', destinationName: '', streetName: '' },
   lassoActive: false, drawnLayer: null,
 };
@@ -238,25 +243,37 @@ const state = {
 const MODE_COLORS = ['#00b39f', '#3d6bff', '#ff3d7f']; // walk, car, bike
 const MODE_LABELS = ['Walking', 'Car', 'Biking'];
 
-// Sequential 5-class color ramps (ColorBrewer-style) for the home/work
-// choropleth layers -- a single opacity ramp on one color reads as "2
-// levels" to the eye; distinct hues per class are what makes density
-// actually legible.
-const HOME_RAMP = ['#d3f5ef', '#8fe3d3', '#45c4ab', '#00967f', '#005c4d'];
-const WORK_RAMP = ['#dbe6ff', '#a7c0ff', '#6f92ff', '#3d6bff', '#1f3fb0'];
+// Sequential 5-class color ramps for the home/work choropleth layers.
+// Noticeably higher contrast than a smooth single-hue opacity ramp -- and
+// see percentileBreaks below for why the BREAK POINTS matter as much as
+// the colors: with real data, the vast majority of hex cells have just 1-2
+// riders, so even quantile breaks (equal COUNT of cells per class) end up
+// putting almost everything in one or two classes and never isolate the
+// genuinely hot spots.
+const HOME_RAMP = ['#eaf7f3', '#9fe0cd', '#45c4ab', '#00866f', '#003d33'];
+const WORK_RAMP = ['#eef2ff', '#b8c9ff', '#7a97ff', '#3d5fe0', '#152876'];
 
-function quantileBreaks(values, nClasses) {
+function percentileBreaks(values) {
+  // Concentrates break points at the tail (50th/75th/90th/97th percentile)
+  // instead of even quintiles -- deliberately unequal class sizes so the
+  // small number of genuinely high-count cells get their own distinct
+  // color rather than being visually diluted into a mass of similar mid-
+  // range cells. This is the actual fix for "no visual distinction": with
+  // quintile breaks on a heavily right-skewed distribution (typical for
+  // home/work density -- most cells have 1-2 people, a few have dozens),
+  // 4 of 5 classes can end up covering the same value (e.g. all "1").
   const sorted = [...values].sort((a, b) => a - b);
-  const breaks = [];
-  for (let i = 1; i < nClasses; i++) {
-    const idx = Math.floor((i / nClasses) * sorted.length);
-    breaks.push(sorted[Math.min(idx, sorted.length - 1)]);
-  }
-  return breaks;
+  const pick = (p) => sorted[Math.min(Math.floor(p * sorted.length), sorted.length - 1)];
+  return [pick(0.50), pick(0.75), pick(0.90), pick(0.97)];
 }
 function classify(value, breaks) {
   for (let i = 0; i < breaks.length; i++) { if (value <= breaks[i]) return i; }
   return breaks.length;
+}
+function filterByMinCount(countsObj, minTrips) {
+  const out = {};
+  for (const [k, v] of Object.entries(countsObj)) { if (v >= minTrips) out[k] = v; }
+  return out;
 }
 
 const map = L.map('map', { zoomControl: true }).setView([31.77, -106.49], 12);
@@ -431,6 +448,9 @@ document.getElementById('mode-pills').addEventListener('click', (e) => {
 });
 document.getElementById('clear-filters').addEventListener('click', () => {
   state.filters = { route: '', stop: '', mode: 'all', categories: new Set(), stopIds: null, homeZip: '', destinationName: '', streetName: '' };
+  state.minTrips = 1;
+  document.getElementById('min-trips-slider').value = 1;
+  document.getElementById('min-trips-val').textContent = '1';
   document.getElementById('route-select').value = '';
   document.getElementById('stop-select').value = '';
   document.getElementById('zip-select').value = '';
@@ -469,10 +489,12 @@ function renderMapLayers() {
 
   if (document.getElementById('toggle-paths').checked) {
     // Actual polylines along the real street geometry, weighted by trip
-    // count -- replaces the earlier fine-hexbin dots, which were only
-    // visible zoomed in extremely close and easy to mistake for "no path
-    // data" at any normal city-wide view.
-    const streetCounts = topBy(filtered.filter(t => t.m === 0 && t.st), 'st', 100000);
+    // count. Any mode with street data draws here (car/biking departures
+    // now carry a short departure-street trace too, not just walking) --
+    // the mode pill filter already restricts `filtered` upstream, so this
+    // does NOT hardcode a mode.
+    const streetCountsRaw = topBy(filtered.filter(t => t.st), 'st', 100000);
+    const streetCounts = streetCountsRaw.filter(([, count]) => count >= state.minTrips);
     const maxC = streetCounts.length ? streetCounts[0][1] : 1;
     streetCounts.forEach(([name, count]) => {
       const lines = state.streetGeom[name];
@@ -486,26 +508,24 @@ function renderMapLayers() {
     });
   }
   if (document.getElementById('toggle-home').checked) {
-    const homeCounts = aggregateHexCounts(filtered, 'hh');
-    const values = Object.values(homeCounts);
-    const breaks = quantileBreaks(values, HOME_RAMP.length);
+    const homeCounts = filterByMinCount(aggregateHexCounts(filtered, 'hh'), state.minTrips);
+    const breaks = percentileBreaks(Object.values(homeCounts));
     for (const [cell, count] of Object.entries(homeCounts)) {
       const ring = hexToPolygonLatLng(cell);
       const cls = classify(count, breaks);
       L.polygon(ring, {
-        color: HOME_RAMP[cls], weight: 0, fillOpacity: 0.75, fillColor: HOME_RAMP[cls],
+        color: HOME_RAMP[cls], weight: 0, fillOpacity: 0.8, fillColor: HOME_RAMP[cls],
       }).bindTooltip(`${count} rider(s) live here`).addTo(homeLayer);
     }
   }
   if (document.getElementById('toggle-work').checked) {
-    const workCounts = aggregateHexCounts(filtered, 'wh');
-    const values = Object.values(workCounts);
-    const breaks = quantileBreaks(values, WORK_RAMP.length);
+    const workCounts = filterByMinCount(aggregateHexCounts(filtered, 'wh'), state.minTrips);
+    const breaks = percentileBreaks(Object.values(workCounts));
     for (const [cell, count] of Object.entries(workCounts)) {
       const ring = hexToPolygonLatLng(cell);
       const cls = classify(count, breaks);
       L.polygon(ring, {
-        color: WORK_RAMP[cls], weight: 0, fillOpacity: 0.75, fillColor: WORK_RAMP[cls],
+        color: WORK_RAMP[cls], weight: 0, fillOpacity: 0.8, fillColor: WORK_RAMP[cls],
       }).bindTooltip(`${count} rider(s) work here`).addTo(workLayer);
     }
   }
@@ -516,8 +536,9 @@ function renderMapLayers() {
       if (!places[key]) places[key] = { name: t.dn, category: t.dc, lat: t.dlat, lon: t.dlon, n: 0 };
       places[key].n += 1;
     });
-    const maxN = Math.max(1, ...Object.values(places).map(p => p.n));
-    Object.values(places).forEach(p => {
+    const shownPlaces = Object.values(places).filter(p => p.n >= state.minTrips);
+    const maxN = Math.max(1, ...shownPlaces.map(p => p.n));
+    shownPlaces.forEach(p => {
       L.circleMarker([p.lat, p.lon], {
         radius: 4 + 12 * Math.sqrt(p.n / maxN), color: '#141414', weight: 1, fillColor: '#f4e600', fillOpacity: 0.85,
       }).bindTooltip(`${p.name} — ${p.n} trip(s)<br>${p.category || ''}`).addTo(destLayer);
@@ -611,12 +632,20 @@ function render() {
   document.getElementById('stat-stops').textContent = new Set(filtered.map(t => t.s)).size;
 
   renderMapLayers();
+  const destEntries = topBy(filtered.filter(t => t.dt === 2), 'dn', 100000).filter(([, c]) => c >= state.minTrips);
   renderExpandableList('destinations', 'chart-destinations', 'showmore-destinations',
-                        topBy(filtered.filter(t => t.dt === 2), 'dn', 100000), 'destinationName', state.filters.destinationName);
+                        destEntries, 'destinationName', state.filters.destinationName);
+  const streetEntries = topBy(filtered.filter(t => t.st), 'st', 100000).filter(([, c]) => c >= state.minTrips);
   renderExpandableList('streets', 'chart-streets', 'showmore-streets',
-                        topBy(filtered.filter(t => t.m === 0 && t.st), 'st', 100000), 'streetName', state.filters.streetName);
+                        streetEntries, 'streetName', state.filters.streetName);
   renderBarChart('chart-modes', topBy(filtered, 'm', 3), (k) => MODE_LABELS[k] || 'Unknown');
 }
+
+document.getElementById('min-trips-slider').addEventListener('input', (e) => {
+  state.minTrips = parseInt(e.target.value, 10);
+  document.getElementById('min-trips-val').textContent = state.minTrips;
+  render();
+});
 
 loadManifest();
 </script>
