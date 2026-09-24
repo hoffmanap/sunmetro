@@ -15,6 +15,18 @@
       "n_routes": 52,
       "n_walking": 39810,
       "has_zips": false
+    },
+    {
+      "id": "combined",
+      "n_trips": 642027,
+      "n_stops": 2165,
+      "n_routes": 52,
+      "n_walking": 76538,
+      "is_combined": true,
+      "source_pulls": [
+        "10169459",
+        "10169748"
+      ]
     }
   ]
 }

@@ -234,7 +234,7 @@ function pointInPolygon(lat, lon, ring) {
 
 // ---------- App state ----------
 const state = {
-  pullId: null, trips: [], stops: [], routes: [], categories: [], streetGeom: {},
+  pullId: null, trips: [], stops: [], routes: [], categories: [], streetGeom: {}, manifest: null,
   stopById: {}, minTrips: 1,
   filters: { route: '', stop: '', mode: 'all', categories: new Set(), stopIds: null, homeZip: '', destinationName: '', streetName: '' },
   lassoActive: false, drawnLayer: null,
@@ -332,23 +332,55 @@ map.on(L.Draw.Event.CREATED, (e) => {
 async function loadManifest() {
   const res = await fetch('data/manifest.json');
   const manifest = await res.json();
+  state.manifest = manifest;  // kept for loadPull to look up is_combined/source_pulls
   const sel = document.getElementById('pull-select');
   sel.innerHTML = '';
-  manifest.pulls.forEach(p => {
+  // The combined pull (from merge_pulls_for_dashboard.py) is listed FIRST
+  // and selected by default -- individual pulls are still available in
+  // the dropdown for drilling into one pull specifically, but the
+  // aggregate view across every pull is what opens by default, since
+  // that's the actual unit of analysis this tool is for.
+  const sorted = [...manifest.pulls].sort((a, b) => (b.is_combined ? 1 : 0) - (a.is_combined ? 1 : 0));
+  sorted.forEach(p => {
     const opt = document.createElement('option');
     opt.value = p.id;
-    opt.textContent = `${p.id} — ${p.n_trips.toLocaleString()} trips, ${p.n_stops} stops`;
+    const label = p.is_combined
+      ? `⭐ All pulls combined — ${p.n_trips.toLocaleString()} trips, ${p.n_stops} stops (${p.source_pulls.length} pulls)`
+      : `${p.id} — ${p.n_trips.toLocaleString()} trips, ${p.n_stops} stops`;
+    opt.textContent = label;
     sel.appendChild(opt);
   });
   sel.addEventListener('change', () => loadPull(sel.value));
-  if (manifest.pulls.length) loadPull(manifest.pulls[0].id);
+  if (sorted.length) loadPull(sorted[0].id);
 }
 
 async function loadPull(pullId) {
   state.pullId = pullId;
   const base = `data/${pullId}/`;
-  const [trips, stops, routes, categories] = await Promise.all([
-    fetch(base + 'trips.json').then(r => r.json()),
+  const manifestEntry = (state.manifest.pulls || []).find(p => p.id === pullId);
+
+  let trips;
+  if (manifestEntry && manifestEntry.is_combined) {
+    // The combined view has no pre-merged trips.json of its own (a merged
+    // file across even 2 pulls already blew past GitHub's 100MB per-file
+    // limit, and would only get worse as more pulls are added) -- instead,
+    // fetch each source pull's OWN trips.json (each safely under the limit
+    // on its own) and concatenate here. Tag each trip with which pull it
+    // came from, in case a future feature wants to filter the combined
+    // view back down to one pull without leaving this view.
+    const perPull = await Promise.all(
+      manifestEntry.source_pulls.map(pid => fetch(`data/${pid}/trips.json`).then(r => r.json()))
+    );
+    trips = [];
+    perPull.forEach((pullTrips, i) => {
+      pullTrips.forEach(t => { t.pl = i; });
+      trips.push(...pullTrips);
+    });
+  } else {
+    trips = await fetch(base + 'trips.json').then(r => r.json());
+  }
+
+  const [stops, routes, categories] = await Promise.all([
     fetch(base + 'stops.json').then(r => r.json()),
     fetch(base + 'routes.json').then(r => r.json()),
     fetch(base + 'categories.json').then(r => r.json()),
