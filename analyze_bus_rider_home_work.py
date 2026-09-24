@@ -184,11 +184,33 @@ def _list_pathing_parts(path: str) -> list:
     return [str(p)]
 
 
+def _open_part_stream(part):
+    """Returns (binary_file_like_object, sep) for a part, decompressing
+    gzip ON THE FLY via gzip.GzipFile wrapping a file handle, rather than
+    ever reading a part's full decompressed content into one bytes blob
+    first (which needs enough contiguous memory for that entire part at
+    once -- risky at this pipeline's real scale, and exactly what caused a
+    separate crash in trace_departures_and_destinations.py's pathing
+    loader earlier; this applies the same proven fix here)."""
+    if isinstance(part, tuple):
+        _, zip_path, entry_name = part
+        zf = zipfile.ZipFile(zip_path)  # left open; closed by the caller via the returned stream's close()
+        fileobj = zf.open(entry_name)
+        if entry_name.lower().endswith(".gz"):
+            fileobj = gzip.GzipFile(fileobj=fileobj)
+        return fileobj, _sniff_sep(entry_name)
+    f = open(part, "rb")
+    magic = f.read(2)
+    f.seek(0)
+    if magic == b"\x1f\x8b":
+        f = gzip.GzipFile(fileobj=f)
+    return f, _sniff_sep(part)
+
+
 def _read_part(part, usecols=None, dtype=None, nrows=None) -> pd.DataFrame:
-    """Reads one part (see _list_pathing_parts), sniffing gzip by magic
-    bytes rather than trusting the extension, and pulling only usecols
-    (with a smaller dtype where given) to keep peak memory down -- these
-    bulk pathing exports carry several columns this pipeline never uses."""
+    """Small-read path (header peeks, etc.) -- reads the whole part, which
+    is fine for nrows=5 peeks but NOT used for the main per-part data load
+    anymore (see load_and_assign_pathing, which streams+chunks instead)."""
     if isinstance(part, tuple):
         _, zip_path, entry_name = part
         sep = _sniff_sep(entry_name)
@@ -202,42 +224,6 @@ def _read_part(part, usecols=None, dtype=None, nrows=None) -> pd.DataFrame:
         compression="gzip" if open(part, "rb").read(2) == b"\x1f\x8b" else None,
         usecols=usecols, dtype=dtype, nrows=nrows, low_memory=False,
     )
-
-
-def read_pathing_source(path: str, overrides: dict) -> pd.DataFrame:
-    """--pathing may be a single file, a .zip of part files, or a directory
-    of already-extracted part files -- bulk pathing exports commonly come
-    chunked into many parts rather than one file. Only the 4 columns this
-    pipeline needs are pulled from each part (at a smaller dtype for
-    lat/lon), and parts are trimmed to those columns BEFORE concatenating
-    -- reading every column of every part first (the naive approach) peaks
-    at several times the memory this needs and is what was running this
-    machine out of RAM on a 20-part, 8GB+ export."""
-    parts = _list_pathing_parts(path)
-    log.info("  found %d part file(s)", len(parts))
-
-    # Peek the first part's header to resolve real column names once;
-    # every part in one export shares the same schema.
-    header = _read_part(parts[0], nrows=5)
-    dev_c = resolve_column(header, "device_id", overrides.get("device_id"))
-    lat_c = resolve_column(header, "pathing_lat", overrides.get("pathing_lat"))
-    lon_c = resolve_column(header, "pathing_lon", overrides.get("pathing_lon"))
-    time_c = resolve_column(header, "pathing_time", overrides.get("pathing_time"))
-    missing = [n for n, c in [("device_id", dev_c), ("lat", lat_c), ("lon", lon_c), ("timestamp", time_c)] if c is None]
-    if missing:
-        raise KeyError(f"Couldn't auto-detect pathing columns {missing} in {path}. "
-                        f"Found: {list(header.columns)}. Use --column-map to override.")
-
-    usecols = [dev_c, lat_c, lon_c, time_c]
-    dtype = {lat_c: "float32", lon_c: "float32"}
-    frames = []
-    for i, part in enumerate(parts):
-        frame = _read_part(part, usecols=usecols, dtype=dtype)
-        frame = frame.rename(columns={dev_c: "device_id", lat_c: "lat", lon_c: "lon", time_c: "timestamp"})
-        frames.append(frame)
-        if (i + 1) % 5 == 0 or i + 1 == len(parts):
-            log.info("  read part %d/%d (%d rows so far)", i + 1, len(parts), sum(len(f) for f in frames))
-    return pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
 
 
 def load_common_location_file(path: str, kind: str, overrides: dict, keep_device_ids: set | None = None) -> pd.DataFrame:
@@ -326,67 +312,47 @@ def dominant_location_per_device(rows: pd.DataFrame, tolerance_m: float, out_lat
     return pd.DataFrame(records)
 
 
-def assign_pings_to_stops(pathing: pd.DataFrame, stops: pd.DataFrame) -> pd.DataFrame:
-    """Grid-buckets both pings and stops into coarse lat/lon cells sized to
-    the buffer radius, then only checks each ping against stops in its own
-    cell + the 8 neighboring cells -- instead of an O(n_stops x n_pings)
-    full-dataframe boolean mask repeated once per stop. A ping can land
-    within radius of more than one stop (e.g. a shared-corner cluster), so
-    this still returns one row per (ping, stop) match, not just the
-    nearest stop.
 
-    Grouping pings by cell uses a single vectorized numpy sort, NOT
-    pandas' groupby(...).groups -- at real scale (100M+ pings), materializing
-    every group's row-index array via pandas' Categorical-based grouping
-    machinery is itself what ran out of memory (a single internal int64
-    array allocation failed at ~150M pings). A sort + np.unique(return_index)
-    finds the same group boundaries in one pass without that per-group
-    index-array overhead, and the per-cell loop that follows operates on
-    plain numpy slices instead of repeated DataFrame .loc lookups."""
-    cell_deg = max(stops["buffer_meters"].max() / 100_000.0, 0.0005)
-    stops = stops.reset_index(drop=True)
-
-    device_id_all = pathing["device_id"].to_numpy()
-    timestamp_all = pathing["timestamp"].to_numpy()
-    lat_all = pathing["lat"].to_numpy()
-    lon_all = pathing["lon"].to_numpy()
-
-    # device_id is typically a long hash string (Azira/Ubermedia exports use
-    # 40-character hex ids) -- at real scale (100M+ pings) storing that as
-    # repeated Python string objects is itself a major memory cost,
-    # separate from the grouping fix above. factorize() replaces it with a
-    # compact integer code plus one small array of the actual unique
-    # strings; codes are mapped back to strings only in the final output.
-    device_codes_all, device_uniques = pd.factorize(device_id_all)
-
-    clat_all = np.round(lat_all / cell_deg).astype(np.int64)
-    clon_all = np.round(lon_all / cell_deg).astype(np.int64)
+def _build_stop_grid(stops: pd.DataFrame, cell_deg: float) -> dict:
     stop_cell_lat = np.round(stops["lat"].to_numpy() / cell_deg).astype(np.int64)
     stop_cell_lon = np.round(stops["lon"].to_numpy() / cell_deg).astype(np.int64)
-
     stop_by_cell: dict[tuple, list[int]] = {}
     for i, (clat, clon) in enumerate(zip(stop_cell_lat, stop_cell_lon)):
         stop_by_cell.setdefault((int(clat), int(clon)), []).append(i)
+    return stop_by_cell
 
-    # Combine (clat, clon) into one sortable int64 key. Offset/multiplier
-    # are generous relative to the plausible range of clat/clon (lat/lon in
-    # degrees divided by a sub-degree cell size), so there's no collision risk.
+
+def _match_chunk_to_stops(lat: np.ndarray, lon: np.ndarray, device_codes: np.ndarray, timestamp: np.ndarray,
+                            stops: pd.DataFrame, stop_by_cell: dict, cell_deg: float) -> tuple:
+    """The actual grid-cell matching logic, scoped to ONE chunk's arrays
+    (typically --pathing-chunksize rows, not the whole pathing export).
+    Returns (matched_device_codes, matched_timestamps, matched_stop_ids) --
+    small arrays (only the ~15-25% of pings that actually land in a stop
+    buffer), not the chunk's full size. This is called once per chunk by
+    load_and_assign_pathing rather than once for the entire dataset, which
+    is what finally puts a hard, predictable ceiling on peak memory: no
+    array anywhere in this pipeline is ever larger than one chunk,
+    regardless of how large the total pathing export is."""
     OFFSET, MULT = 2_000_000, 5_000_000
-    cell_key_all = (clat_all + OFFSET) * MULT + (clon_all + OFFSET)
+    clat = np.round(lat / cell_deg).astype(np.int64)
+    clon = np.round(lon / cell_deg).astype(np.int64)
+    cell_key = (clat + OFFSET) * MULT + (clon + OFFSET)
+    del clat, clon
 
-    order = np.argsort(cell_key_all, kind="stable")
-    cell_key_sorted = cell_key_all[order]
-    clat_sorted, clon_sorted = clat_all[order], clon_all[order]
-    lat_sorted, lon_sorted = lat_all[order], lon_all[order]
-    device_code_sorted, timestamp_sorted = device_codes_all[order], timestamp_all[order]
-    del order, cell_key_all, clat_all, clon_all, lat_all, lon_all, device_id_all, device_codes_all, timestamp_all
+    order = np.argsort(cell_key, kind="stable")
+    cell_key_sorted = cell_key[order]
+    del cell_key
+    lat_sorted, lon_sorted = lat[order], lon[order]
+    device_code_sorted, timestamp_sorted = device_codes[order], timestamp[order]
+    del order
+    clat_sorted = cell_key_sorted // MULT - OFFSET
+    clon_sorted = cell_key_sorted % MULT - OFFSET
 
     unique_keys, starts = np.unique(cell_key_sorted, return_index=True)
     ends = np.append(starts[1:], len(cell_key_sorted))
-    log.info("  %d pings grouped into %d distinct grid cells", len(cell_key_sorted), len(unique_keys))
 
     neighbor_offsets = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 0), (0, 1), (1, -1), (1, 0), (1, 1)]
-    device_codes, timestamps, stop_ids_out = [], [], []
+    out_codes, out_ts, out_stops = [], [], []
     for gi in range(len(unique_keys)):
         start, end = starts[gi], ends[gi]
         clat, clon = int(clat_sorted[start]), int(clon_sorted[start])
@@ -396,7 +362,6 @@ def assign_pings_to_stops(pathing: pd.DataFrame, stops: pd.DataFrame) -> pd.Data
         if not candidate_idx:
             continue
         cand = stops.iloc[candidate_idx]
-        # Vectorized (n_pings_in_cell x n_candidate_stops) distance matrix.
         lat1 = lat_sorted[start:end][:, None]
         lon1 = lon_sorted[start:end][:, None]
         lat2 = cand["lat"].to_numpy()[None, :]
@@ -406,19 +371,109 @@ def assign_pings_to_stops(pathing: pd.DataFrame, stops: pd.DataFrame) -> pd.Data
         ping_i, stop_j = np.nonzero(within)
         if len(ping_i) == 0:
             continue
-        device_codes.append(device_code_sorted[start:end][ping_i])
-        timestamps.append(timestamp_sorted[start:end][ping_i])
-        stop_ids_out.append(cand["stop_id"].to_numpy()[stop_j])
-        if (gi + 1) % 20_000 == 0:
-            log.info("  processed %d/%d grid cells", gi + 1, len(unique_keys))
+        out_codes.append(device_code_sorted[start:end][ping_i])
+        out_ts.append(timestamp_sorted[start:end][ping_i])
+        out_stops.append(cand["stop_id"].to_numpy()[stop_j])
+    if not out_codes:
+        return np.array([], dtype=np.int32), np.array([], dtype="datetime64[ns]"), np.array([], dtype=object)
+    return np.concatenate(out_codes), np.concatenate(out_ts), np.concatenate(out_stops)
 
-    if not device_codes:
+
+def load_and_assign_pathing(path: str, overrides: dict, stops: pd.DataFrame, chunksize: int = 1_000_000) -> pd.DataFrame:
+    """Single-pass streaming: reads the pathing export chunksize rows at a
+    time, directly from disk, and immediately runs the stop-buffer matching
+    on EACH CHUNK -- never assembling the full pathing dataset (device_id,
+    lat, lon, timestamp for every ping) in memory at any point, at any
+    stage. Only the MATCHED rows accumulate across chunks, and those are a
+    small fraction of the total (typically 15-25% of pings land in a stop
+    buffer), so the running accumulation stays modest even across a
+    200M+-row export.
+
+    This replaces an earlier two-phase design (load ALL pathing into
+    memory first, THEN run matching on the full result) that hit three
+    separate out-of-memory crashes in a row at real data scale, each one
+    at a later point in the pipeline than the last: first while reading
+    parts, then during the final concat, then during a whole-dataset
+    timestamp conversion. Each was fixed individually, but all three were
+    symptoms of the same root design mismatch, not independent bugs -- any
+    operation over the FULL dataset needs roughly 2x its size in free
+    memory at its peak, and this machine doesn't have that much free RAM
+    at 195M+ rows. Bounding every stage to one chunk at a time, with
+    --pathing-chunksize as the single dial, is the fix that stops requiring
+    a new patch for each newly-discovered bottleneck."""
+    cell_deg = max(stops["buffer_meters"].max() / 100_000.0, 0.0005)
+    stops = stops.reset_index(drop=True)
+    stop_by_cell = _build_stop_grid(stops, cell_deg)
+
+    parts = _list_pathing_parts(path)
+    log.info("  found %d part file(s)", len(parts))
+    header = _read_part(parts[0], nrows=5)
+    dev_c = resolve_column(header, "device_id", overrides.get("device_id"))
+    lat_c = resolve_column(header, "pathing_lat", overrides.get("pathing_lat"))
+    lon_c = resolve_column(header, "pathing_lon", overrides.get("pathing_lon"))
+    time_c = resolve_column(header, "pathing_time", overrides.get("pathing_time"))
+    missing = [n for n, c in [("device_id", dev_c), ("lat", lat_c), ("lon", lon_c), ("timestamp", time_c)] if c is None]
+    if missing:
+        raise KeyError(f"Couldn't auto-detect pathing columns {missing} in {path}. "
+                        f"Found: {list(header.columns)}. Use --column-map to override.")
+
+    usecols = [dev_c, lat_c, lon_c, time_c]
+    dtype = {lat_c: "float32", lon_c: "float32"}
+    device_map: dict[str, int] = {}
+    match_codes, match_ts, match_stops = [], [], []
+    total_rows, total_matches = 0, 0
+    for i, part in enumerate(parts):
+        stream, sep = _open_part_stream(part)
+        try:
+            reader = pd.read_csv(stream, sep=sep, usecols=usecols, dtype=dtype,
+                                  chunksize=chunksize, low_memory=False)
+            for chunk in reader:
+                chunk = chunk.rename(columns={dev_c: "device_id", lat_c: "lat", lon_c: "lon", time_c: "timestamp"})
+                total_rows += len(chunk)
+
+                ts_raw = chunk["timestamp"].to_numpy()
+                ts = pd.to_datetime(ts_raw, unit="s", errors="coerce") if np.issubdtype(ts_raw.dtype, np.number) \
+                    else pd.to_datetime(ts_raw, errors="coerce")
+                ts = ts.to_numpy()
+                lat = chunk["lat"].to_numpy()
+                lon = chunk["lon"].to_numpy()
+                valid = ~(np.isnan(lat) | np.isnan(lon) | pd.isna(ts))
+                if not valid.any():
+                    continue
+                chunk_device_id = chunk["device_id"].astype(str).to_numpy()[valid]
+                lat, lon, ts = lat[valid], lon[valid], ts[valid]
+
+                local_codes, local_uniques = pd.factorize(chunk_device_id)
+                global_for_local = np.empty(len(local_uniques), dtype=np.int32)
+                for j, d in enumerate(local_uniques):
+                    code = device_map.get(d)
+                    if code is None:
+                        code = len(device_map)
+                        device_map[d] = code
+                    global_for_local[j] = code
+                device_codes = global_for_local[local_codes]
+
+                codes_m, ts_m, stops_m = _match_chunk_to_stops(lat, lon, device_codes, ts, stops, stop_by_cell, cell_deg)
+                if len(codes_m):
+                    match_codes.append(codes_m); match_ts.append(ts_m); match_stops.append(stops_m)
+                    total_matches += len(codes_m)
+        finally:
+            stream.close()
+        if (i + 1) % 5 == 0 or i + 1 == len(parts):
+            log.info("  read part %d/%d (%d rows so far, %d distinct devices, %d matched to a stop buffer)",
+                      i + 1, len(parts), total_rows, len(device_map), total_matches)
+
+    device_uniques = np.empty(len(device_map), dtype=object)
+    for d, c in device_map.items():
+        device_uniques[c] = d
+
+    if not match_codes:
         return pd.DataFrame(columns=["device_id", "timestamp", "stop_id"])
-    all_codes = np.concatenate(device_codes)
+    all_codes = np.concatenate(match_codes)
     return pd.DataFrame({
         "device_id": device_uniques[all_codes],
-        "timestamp": np.concatenate(timestamps),
-        "stop_id": np.concatenate(stop_ids_out),
+        "timestamp": np.concatenate(match_ts),
+        "stop_id": np.concatenate(match_stops),
     })
 
 
@@ -551,6 +606,9 @@ def parse_args(argv=None):
                     help="Ping gap that starts a new dwell episode at a stop.")
     p.add_argument("--min-dwell-minutes", type=float, default=DEFAULT_MIN_DWELL_MINUTES,
                     help="Minimum single-episode dwell time at a stop to count as a likely rider, not a passerby.")
+    p.add_argument("--pathing-chunksize", type=int, default=1_000_000,
+                    help="Rows read at a time from each pathing part file. Lower this (e.g. 250000) if the "
+                         "machine still runs out of memory on a single very large part.")
     p.add_argument("--out", default="rider_output/")
     return p.parse_args(argv)
 
@@ -582,15 +640,9 @@ def main(argv=None):
     # before the per-device clustering step (not after) is what keeps this
     # fast; clustering location history for every device in the export
     # when only a few thousand ever show up at a stop is wasted work.
-    log.info("Loading pathing extract from %s ...", args.pathing)
-    pathing = read_pathing_source(args.pathing, overrides)
-    pathing["timestamp"] = pd.to_datetime(pathing["timestamp"], unit="s", errors="coerce") if np.issubdtype(
-        pathing["timestamp"].dtype, np.number) else pd.to_datetime(pathing["timestamp"], errors="coerce")
-    pathing = pathing.dropna(subset=["lat", "lon", "timestamp", "device_id"])
-    log.info("Loaded %d pings for %d devices.", len(pathing), pathing["device_id"].nunique())
-
-    log.info("Assigning pings to stop buffers ...")
-    assigned = assign_pings_to_stops(pathing, stops)
+    log.info("Loading pathing extract and assigning pings to stop buffers (streamed, %d rows/chunk) ...",
+              args.pathing_chunksize)
+    assigned = load_and_assign_pathing(args.pathing, overrides, stops, chunksize=args.pathing_chunksize)
     log.info("%d pings landed inside a stop buffer.", len(assigned))
     if assigned.empty:
         log.error("No pings fell within any stop buffer -- check that --pathing and --stops cover the same area.")

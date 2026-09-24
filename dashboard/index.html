@@ -371,11 +371,16 @@ async function loadPull(pullId) {
     const perPull = await Promise.all(
       manifestEntry.source_pulls.map(pid => fetch(`data/${pid}/trips.json`).then(r => r.json()))
     );
-    trips = [];
+    let merged = [];
     perPull.forEach((pullTrips, i) => {
       pullTrips.forEach(t => { t.pl = i; });
-      trips.push(...pullTrips);
+      merged = merged.concat(pullTrips);  // NOT trips.push(...pullTrips) -- spreading a
+                                            // 300,000+ element array into individual function
+                                            // arguments overflows the JS call stack. concat()
+                                            // copies elements internally instead, so it has no
+                                            // such limit.
     });
+    trips = merged;
   } else {
     trips = await fetch(base + 'trips.json').then(r => r.json());
   }
